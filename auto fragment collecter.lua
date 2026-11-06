@@ -199,8 +199,8 @@ local function holdOnFragment(hrp, baseStandY, rot, v, part, homePos, hopFirst)
 			pin(hrp, curPos + Vector3.new(0, yOffset, 0), rot)
 
 			if firetouchinterest then
-				pcall(firetouchinterest, hrp, part, 0)
-				pcall(firetouchinterest, hrp, part, 1)
+				pcall(firetouchinterest, hrp, part, false)
+				pcall(firetouchinterest, hrp, part, true)
 			end
 
 			t += RunService.Heartbeat:Wait()
