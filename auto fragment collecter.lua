@@ -7,25 +7,25 @@ local TweenService = game:GetService("TweenService")
 local plr = Players.LocalPlayer
 local pickups = workspace:WaitForChild("Pickups")
 
-local MAX_DIST = 1000        -- only target fragments within this distance of home
-local TWEEN_SPEED = 350      -- studs per second when gliding
-local MIN_TWEEN_TIME = 0.08  -- fastest tween duration (for nearby fragments)
-local MAX_TWEEN_TIME = 0.45  -- cap on tween duration (so far fragments are still fast)
-local HOLD_TIME = 0.40       -- seconds spent touching each fragment on arrival
-local MAX_ATTEMPTS = 5       -- retries per fragment (handles spawn immunity)
-local RETRY_COOLDOWN = 0.5   -- seconds to wait before retrying a stubborn fragment
-local SINK = 1.5             -- how far below standing height to sink feet into floor fragments
-local LIFT = 6               -- smooth hop height to reset TouchTransmitter
+local MAX_DIST = 1000        -- max distance from home position
+local TWEEN_SPEED = 350      -- studs per second when tweening
+local MIN_TWEEN_TIME = 0.08  -- shortest tween duration
+local MAX_TWEEN_TIME = 0.40  -- longest tween duration
+local TRY_WAIT = 0.22        -- seconds to stand steadily on fragment per try
+local MAX_TRIES = 3          -- touch tries per visit (sinks deeper on each try)
+local LIFT = 8               -- step-off height between tries so .Touched fires fresh
+local RETRY_COOLDOWN = 0.8   -- seconds before distance-check re-targets a stubborn fragment
 local DEBUG = true           -- set to false to silence F9 console prints
+
+-- Progressive sink depths across the 3 tries so flat floor fragments never get missed
+local SINK_LEVELS = { 0.5, 1.8, 3.0 }
 
 local alive = true
 local busy = false
 local activeTween = nil
 local picked = setmetatable({}, { __mode = "k" })
-local attempts = setmetatable({}, { __mode = "k" })
 local skipUntil = setmetatable({}, { __mode = "k" })
-local hadTouch = setmetatable({}, { __mode = "k" })
-local unknownNames = {}
+local visits = setmetatable({}, { __mode = "k" })
 local conns = {}
 
 local function log(...)
@@ -70,27 +70,15 @@ local function getPart(v)
 	return v:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function isCollectable(v, part)
-	if not v or not part then return false, "missing_part" end
-	if picked[v] then return false, "already_marked" end
-	if not v:IsDescendantOf(pickups) or not part:IsDescendantOf(workspace) then
-		return false, "removed"
-	end
-	if part.Transparency >= 0.95 then
-		return false, "transparent_picked"
-	end
-	local hasTI = (part:FindFirstChildOfClass("TouchTransmitter") ~= nil)
-		or (v:FindFirstChildWhichIsA("TouchTransmitter", true) ~= nil)
-	if hasTI then
-		hadTouch[v] = true
-	elseif hadTouch[v] then
-		return false, "touch_removed"
-	end
-	return true
+local function isPresent(v, part)
+	return v ~= nil
+		and part ~= nil
+		and v:IsDescendantOf(pickups)
+		and part:IsDescendantOf(workspace)
 end
 
-local function checkDistance(partPos, originPos)
-	local dist = (partPos - originPos).Magnitude
+local function checkDistance(partPos, homePos)
+	local dist = (partPos - homePos).Magnitude
 	return dist <= MAX_DIST, dist
 end
 
@@ -100,17 +88,17 @@ local function pin(hrp, pos, rot)
 	hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
--- Smoothly tween hrp to a target position; cancels early if checkFn() returns false
+-- Smoothly tween hrp to targetPos; aborts immediately if checkFn() returns false
 local function tweenTo(hrp, targetPos, rot, checkFn)
 	cancelTween()
 
 	local dist = (targetPos - hrp.Position).Magnitude
-	if dist < 1 then
+	if dist < 1.5 then
 		pin(hrp, targetPos, rot)
 		return true
 	end
 
-	local duration = .1
+	local duration = math.clamp(dist / TWEEN_SPEED, MIN_TWEEN_TIME, MAX_TWEEN_TIME)
 	local info = TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
 	local tween = TweenService:Create(hrp, info, { CFrame = CFrame.new(targetPos) * rot })
 	activeTween = tween
@@ -139,44 +127,87 @@ local function tweenTo(hrp, targetPos, rot, checkFn)
 	return true
 end
 
--- Find nearest valid fragment within MAX_DIST of homePos
-local function getNext(hrpPos, homePos)
+-- Pass 1: Unpicked fragments within MAX_DIST
+-- Pass 2 (Distance Fallback): Any fragment still within MAX_DIST (ignores picked[v] label!)
+local function getNextByDistance(hrpPos, homePos)
 	local now = os.clock()
-	local best, bestPart, bestAtt, bestDist, bestHomeDist
+	local best, bestPart, bestDist, bestHomeDist
+	local fallback, fallbackPart, fallbackDist, fallbackHomeDist
 
 	for _, v in pickups:GetChildren() do
-		if v.Name ~= "Fragment" then
-			if DEBUG and not unknownNames[v.Name] then
-				unknownNames[v.Name] = true
-				log("Note: Found non-'Fragment' item in Pickups:", v.Name, v.ClassName)
-			end
-			continue
-		end
-		if picked[v] then continue end
+		if v.Name ~= "Fragment" then continue end
 		if (skipUntil[v] or 0) > now then continue end
 
 		local part = getPart(v)
-		if not part then continue end
+		if not isPresent(v, part) then continue end
 
-		local ok, reason = isCollectable(v, part)
-		if not ok then
-			picked[v] = true
-			log("Marking dead fragment during scan:", v:GetFullName(), "| Reason:", reason)
-			continue
-		end
-
+		-- Strict distance check from homePos
 		local withinMax, homeDist = checkDistance(part.Position, homePos)
 		if not withinMax then continue end
 
-		local att = attempts[v] or 0
 		local curDist = (part.Position - hrpPos).Magnitude
 
-		if not best or att < bestAtt or (att == bestAtt and curDist < bestDist) then
-			best, bestPart, bestAtt, bestDist, bestHomeDist = v, part, att, curDist, homeDist
+		if not picked[v] then
+			-- Priority 1: Fresh/unmarked fragments
+			if not best or curDist < bestDist then
+				best, bestPart, bestDist, bestHomeDist = v, part, curDist, homeDist
+			end
+		else
+			-- Priority 2: Distance-check fallback (ignores picked[v] if still sitting in range)
+			if not fallback or curDist < fallbackDist then
+				fallback, fallbackPart, fallbackDist, fallbackHomeDist = v, part, curDist, homeDist
+			end
 		end
 	end
 
-	return best, bestPart, bestDist, bestHomeDist
+	if best then
+		return best, bestPart, bestDist, bestHomeDist, false
+	end
+	return fallback, fallbackPart, fallbackDist, fallbackHomeDist, true
+end
+
+-- Stand steadily on the fragment across MAX_TRIES, sinking deeper each try and hopping between tries
+local function holdOnFragment(hrp, baseStandY, rot, v, part, homePos, hopFirst)
+	for try = 1, MAX_TRIES do
+		local sink = SINK_LEVELS[try] or SINK_LEVELS[#SINK_LEVELS]
+		local yOffset = math.max(0, baseStandY - sink)
+
+		-- Step off into the air for 3 frames between tries so TouchTransmitter fires fresh
+		if try > 1 or hopFirst then
+			for _ = 1, 3 do
+				if not alive or getRoot() ~= hrp then return "respawned" end
+				if not isPresent(v, part) then return "picked" end
+				if not checkDistance(part.Position, homePos) then return "out_of_range" end
+				pin(hrp, part.Position + Vector3.new(0, baseStandY + LIFT, 0), rot)
+				RunService.Heartbeat:Wait()
+			end
+		end
+
+		-- Hold steadily on the fragment for TRY_WAIT seconds
+		local t = 0
+		while alive and t < TRY_WAIT do
+			if getRoot() ~= hrp then return "respawned" end
+			if not isPresent(v, part) then return "picked" end
+
+			local curPos = part.Position
+			local withinMax, dHome = checkDistance(curPos, homePos)
+			if not withinMax then
+				log(string.format("   [DIST STOP] Fragment moved to %.1f studs (> MAX_DIST %d)", dHome, MAX_DIST))
+				return "out_of_range"
+			end
+
+			pin(hrp, curPos + Vector3.new(0, yOffset, 0), rot)
+
+			if firetouchinterest then
+				pcall(firetouchinterest, hrp, part, 0)
+				pcall(firetouchinterest, hrp, part, 1)
+			end
+
+			t += RunService.Heartbeat:Wait()
+		end
+	end
+
+	return isPresent(v, part) and "still_present" or "picked"
 end
 
 local function collect()
@@ -187,107 +218,71 @@ local function collect()
 	local homePos = startCF.Position
 	local rot = startCF.Rotation
 
-	local v, part, curDist, homeDist = getNext(homePos, homePos)
+	local v, part, curDist, homeDist, isFallback = getNextByDistance(homePos, homePos)
 	if not v then return end
 
-	local footOffset = math.max(0, standHeight(hum, hrp) - SINK)
-	log(string.format("Starting batch | Home locked at %s | StandOffset: %.1f", fmtVec(homePos), footOffset))
+	local baseStandY = standHeight(hum, hrp)
+	log(string.format("Starting batch | Home locked at %s | StandHeight: %.1f", fmtVec(homePos), baseStandY))
 	local pickedCount = 0
 
 	while alive and v and part do
-		attempts[v] = (attempts[v] or 0) + 1
+		visits[v] = (visits[v] or 0) + 1
 		log(string.format(
-			"-> Tweening to: %s | Dist: %.1f | HomeDist: %.1f/%d | Attempt %d/%d",
-			v:GetFullName(), curDist, homeDist, MAX_DIST, attempts[v], MAX_ATTEMPTS
+			"-> [%s] %s | Dist: %.1f | HomeDist: %.1f/%d | Visit #%d",
+			isFallback and "DIST-FALLBACK" or "FRESH",
+			v:GetFullName(), curDist, homeDist, MAX_DIST, visits[v]
 		))
 
-		local status = "timeout"
-
-		-- 1. Smoothly tween to the fragment, aborting immediately if it's picked up or leaves MAX_DIST
-		local goalPos = part.Position + Vector3.new(0, footOffset, 0)
-		local reached, abortReason = tweenTo(hrp, goalPos, rot, function()
-			local ok, r = isCollectable(v, part)
-			if not ok then return false, r end
-			local withinMax = checkDistance(part.Position, homePos)
-			if not withinMax then return false, "out_of_range" end
+		-- 1. Smoothly tween to the fragment
+		local initialY = math.max(0, baseStandY - SINK_LEVELS[1])
+		local reached, abortReason = tweenTo(hrp, part.Position + Vector3.new(0, initialY, 0), rot, function()
+			if not isPresent(v, part) then return false, "picked" end
+			if not checkDistance(part.Position, homePos) then return false, "out_of_range" end
 			return true
 		end)
 
+		local status
 		if not reached then
 			if abortReason == "respawned" then
-				log("Batch aborted: character changed/respawned")
+				log("Batch aborted: character respawned")
 				return
 			end
 			status = abortReason
 		else
-			-- 2. Hold on the fragment with a smooth sine wave vertical sweep to trigger .Touched
-			local t = 0
-			while alive and t < HOLD_TIME do
-				if getRoot() ~= hrp then
-					cancelTween()
-					log("Batch aborted: character changed/respawned")
-					return
-				end
-
-				local ok, reason = isCollectable(v, part)
-				if not ok then
-					status = reason
-					break
-				end
-
-				local curPos = part.Position
-				local withinMax, dHome = checkDistance(curPos, homePos)
-				if not withinMax then
-					status = "out_of_range"
-					log(string.format("   [DIST STOP] Fragment at %.1f studs exceeds MAX_DIST (%d)", dHome, MAX_DIST))
-					break
-				end
-
-				-- Smooth vertical wave between root-level (0) and lifted hop (footOffset + LIFT)
-				local wave = (math.sin(t * 25) + 1) * 0.5
-				local yOff = wave * (footOffset + LIFT)
-				pin(hrp, curPos + Vector3.new(0, yOff, 0), rot)
-
-				if firetouchinterest then
-					pcall(firetouchinterest, hrp, part, false)
-					pcall(firetouchinterest, hrp, part, true)
-				end
-
-				t += RunService.Heartbeat:Wait()
+			-- 2. Hold steadily on the fragment (with step-off hops and deeper sink per try)
+			status = holdOnFragment(hrp, baseStandY, rot, v, part, homePos, visits[v] > 1)
+			if status == "respawned" then
+				log("Batch aborted: character respawned")
+				return
 			end
 		end
 
-		-- Evaluate fragment state after visit
-		local stillValid, endReason = isCollectable(v, part)
-		if not stillValid then
-			status = endReason
-		end
-
-		if status == "removed" or status == "transparent_picked" or status == "touch_removed" then
+		if status == "picked" or not isPresent(v, part) then
 			picked[v] = true
 			pickedCount += 1
-			log(string.format("   [PICKED] Confirmed pickup (%s)", status))
+			log("   [PICKED] Fragment collected and removed!")
 		elseif status == "out_of_range" then
+			picked[v] = true
 			skipUntil[v] = os.clock() + RETRY_COOLDOWN
+			log("   [OUT OF RANGE] Stopped following fragment past MAX_DIST")
 		else
-			if attempts[v] >= MAX_ATTEMPTS then
-				picked[v] = true
-				log(string.format("   [MARKED DONE] Reached %d attempts; marked so we stop visiting it", MAX_ATTEMPTS))
-			else
-				skipUntil[v] = os.clock() + RETRY_COOLDOWN
-				log(string.format("   [RETRY] Still present (spawn delay/lag) -> retrying in %.1fs", RETRY_COOLDOWN))
-			end
+			-- Fragment is still in workspace.Pickups after our visit:
+			-- Mark picked[v] = true so fresh fragments go first, and set a short cooldown.
+			-- If it is STILL in range after RETRY_COOLDOWN, getNextByDistance's fallback pass will grab it anyway!
+			picked[v] = true
+			skipUntil[v] = os.clock() + RETRY_COOLDOWN
+			log(string.format("   [STILL IN RANGE] Marked visited -> distance check will re-verify in %.1fs", RETRY_COOLDOWN))
 		end
 
-		v, part, curDist, homeDist = getNext(hrp.Position, homePos)
+		v, part, curDist, homeDist, isFallback = getNextByDistance(hrp.Position, homePos)
 	end
 
-	-- Smoothly tween back to the exact starting position
+	-- Smoothly tween back to home position
 	if getRoot() == hrp then
 		log("Tweening back to home:", fmtVec(homePos))
 		tweenTo(hrp, homePos, rot)
 		pin(hrp, homePos, rot)
-		log(string.format("Batch finished | Returned to %s | Picked up: %d", fmtVec(homePos), pickedCount))
+		log(string.format("Batch finished | Returned to %s | Confirmed picked: %d", fmtVec(homePos), pickedCount))
 	end
 end
 
@@ -326,9 +321,8 @@ end))
 
 table.insert(conns, pickups.ChildRemoved:Connect(function(child)
 	picked[child] = nil
-	attempts[child] = nil
 	skipUntil[child] = nil
-	hadTouch[child] = nil
+	visits[child] = nil
 end))
 
 getgenv().fragStop = function()
@@ -340,8 +334,9 @@ getgenv().fragStop = function()
 	log("Stopped fragment collector.")
 end
 
-log("Fragment collector started (Tween mode) | MAX_DIST =", MAX_DIST)
+log("Fragment collector started (Tween + Distance Fallback) | MAX_DIST =", MAX_DIST)
 
+-- Continuous distance scanner (catches any fragments within MAX_DIST regardless of picked label)
 task.spawn(function()
 	while alive do
 		tryCollect()
